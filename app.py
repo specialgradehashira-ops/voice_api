@@ -1,39 +1,27 @@
-import io, os, tempfile, asyncio, subprocess, textwrap
+import io, os, tempfile, asyncio, subprocess
 from flask import Flask, request, send_file, jsonify
 import edge_tts
 import imageio_ffmpeg
 
 app = Flask(__name__)
 
+# Static FFmpeg from imageio-ffmpeg (works on Render free)
 FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe()
-FFPROBE_BIN = imageio_ffmpeg.get_ffprobe_exe()
 
 VOICES_ALLOWED = {"en-US-JennyNeural", "en-US-GuyNeural", "en-GB-LibbyNeural"}
 
-def ffprobe_duration(path: str) -> float:
-    cmd = [
-        FFPROBE_BIN, "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        path,
-    ]
-    out = subprocess.check_output(cmd).decode().strip()
-    return float(out)
-
 async def tts_to_mp3(text: str, voice="en-US-JennyNeural", rate="0%", volume="0%") -> str:
-    # Split long text into safe ~3800-char chunks (prefer end of sentence)
-    t = text.strip() or " "
-    chunks = []
-    CHUNK = 3800
+    """Generate MP3 from text with edge-tts, chunking long text safely."""
+    t = (text or "").strip() or " "
+    chunks, CHUNK = [], 3800
     while t:
         c = t[:CHUNK]
         cut = c.rfind(". ")
         if cut > 1200:
-            c = c[:cut+1]
+            c = c[:cut + 1]
         chunks.append(c)
         t = t[len(c):]
 
-    # Produce one temp mp3 per chunk
     part_paths = []
     for c in chunks:
         communicate = edge_tts.Communicate(
@@ -46,7 +34,6 @@ async def tts_to_mp3(text: str, voice="en-US-JennyNeural", rate="0%", volume="0%
             if part[0] == "audio":
                 buf.write(part[1])
         buf.seek(0)
-        # write bytes to mp3 file
         part = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
         with open(part.name, "wb") as f:
             f.write(buf.getvalue())
@@ -55,7 +42,7 @@ async def tts_to_mp3(text: str, voice="en-US-JennyNeural", rate="0%", volume="0%
     if len(part_paths) == 1:
         return part_paths[0]
 
-    # Concatenate mp3s using ffmpeg concat demuxer (no re-encode of intermediate)
+    # Concatenate MP3s without re-encoding
     list_file = tempfile.NamedTemporaryFile(delete=False, suffix=".txt").name
     with open(list_file, "w", encoding="utf-8") as f:
         for p in part_paths:
@@ -71,33 +58,22 @@ async def tts_to_mp3(text: str, voice="en-US-JennyNeural", rate="0%", volume="0%
     subprocess.check_call(cmd)
     return out_mp3
 
-def mux_loop_or_trim(video_path: str, audio_path: str) -> str:
-    vdur = ffprobe_duration(video_path)
-    adur = ffprobe_duration(audio_path)
+def mux_video_with_audio(video_path: str, audio_path: str) -> str:
+    """
+    Always loop the video and stop at the shortest stream.
+    - If audio < video: stops at audio end (video effectively trimmed).
+    - If audio > video: video loops until audio ends.
+    """
     out_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
-
-    if adur > vdur + 0.05:
-        # Loop video until audio ends, stop at audio with -shortest
-        cmd = [
-            FFMPEG_BIN, "-y",
-            "-stream_loop", "-1", "-i", video_path,
-            "-i", audio_path,
-            "-map", "0:v:0", "-map", "1:a:0",
-            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-            "-shortest",
-            out_path
-        ]
-    else:
-        # Trim video to audio length
-        cmd = [
-            FFMPEG_BIN, "-y",
-            "-i", video_path,
-            "-i", audio_path,
-            "-map", "0:v:0", "-map", "1:a:0",
-            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-            "-shortest",
-            out_path
-        ]
+    cmd = [
+        FFMPEG_BIN, "-y",
+        "-stream_loop", "-1", "-i", video_path,   # loop video indefinitely
+        "-i", audio_path,                         # audio (mp3)
+        "-map", "0:v:0", "-map", "1:a:0",
+        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+        "-shortest",
+        out_path
+    ]
     subprocess.check_call(cmd)
     return out_path
 
@@ -112,17 +88,13 @@ def process_video():
         voice = request.form.get("voice", "en-US-JennyNeural")
         rate = request.form.get("rate", "0%")
         volume = request.form.get("volume", "0%")
-        if not text:
-            text = " "
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as vf:
             upfile.save(vf.name)
             video_path = vf.name
 
         audio_mp3 = asyncio.run(tts_to_mp3(text, voice=voice, rate=rate, volume=volume))
-
-        # Use mp3 directly (ffmpeg will transcode to AAC while muxing)
-        out_path = mux_loop_or_trim(video_path, audio_mp3)
+        out_path = mux_video_with_audio(video_path, audio_mp3)
 
         return send_file(out_path, mimetype="video/mp4", as_attachment=True, download_name="output.mp4")
 
