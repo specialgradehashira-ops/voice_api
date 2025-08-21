@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: media-processor
+    name: voice-api
     env: python
     buildCommand: pip install -r requirements.txt
     startCommand: python app.py
