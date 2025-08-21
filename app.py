@@ -3,16 +3,16 @@ import io
 import asyncio
 import tempfile
 import subprocess
-from typing import List
+from typing import List, Tuple, Union, Any
 from flask import Flask, request, send_file, jsonify
 import edge_tts
 import imageio_ffmpeg
 
 app = Flask(__name__)
 
-FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe()  # bundled ffmpeg from wheel
+FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe()
 
-# Tunables (can override in Render → Environment)
+# Tunables (you can override these in Render → Environment)
 TEXT_MAX_CHARS = int(os.environ.get("TEXT_MAX_CHARS", "20000"))
 TTS_CHARS_PER_CHUNK = int(os.environ.get("TTS_CHARS_PER_CHUNK", "2200"))  # smaller => lower RAM spikes
 
@@ -29,6 +29,32 @@ def normalize_rate(val: str) -> str:
         return f"{n:+d}%"
     except Exception:
         return "0%"
+
+
+def _event_type_and_bytes(evt: Any) -> Tuple[Union[str, None], Union[bytes, None]]:
+    """
+    edge-tts .stream() sometimes yields tuples ('audio', b'...'),
+    and other times dict/objects with .type/.data or keys 'type'/'data'.
+    This normalizer handles all of them.
+    """
+    # tuple/list: ('audio', b'...')
+    if isinstance(evt, (list, tuple)) and len(evt) >= 2:
+        etype, data = evt[0], evt[1]
+        return (etype if isinstance(etype, str) else None,
+                data if isinstance(data, (bytes, bytearray)) else None)
+
+    # dict-like: {'type': 'audio', 'data': b'...'} or {'type':'audio','audio':b'...'}
+    if isinstance(evt, dict):
+        etype = evt.get("type")
+        data = evt.get("data") or evt.get("audio")
+        return (etype if isinstance(etype, str) else None,
+                data if isinstance(data, (bytes, bytearray)) else None)
+
+    # object with attributes: evt.type / evt.data / evt.audio
+    etype = getattr(evt, "type", None)
+    data = getattr(evt, "data", None) or getattr(evt, "audio", None)
+    return (etype if isinstance(etype, str) else None,
+            data if isinstance(data, (bytes, bytearray)) else None)
 
 
 async def tts_to_mp3_streaming(text: str, voice="en-US-JennyNeural", rate="0%", volume="0%") -> str:
@@ -53,9 +79,10 @@ async def tts_to_mp3_streaming(text: str, voice="en-US-JennyNeural", rate="0%", 
         communicate = edge_tts.Communicate(chunk, voice=voice, rate=rate, volume=volume)
         f = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
         try:
-            async for part in communicate.stream():
-                if part[0] == "audio":
-                    f.write(part[1])
+            async for evt in communicate.stream():
+                etype, audio_bytes = _event_type_and_bytes(evt)
+                if etype == "audio" and audio_bytes:
+                    f.write(audio_bytes)
         finally:
             f.close()
         out_paths.append(f.name)
@@ -67,7 +94,6 @@ async def tts_to_mp3_streaming(text: str, voice="en-US-JennyNeural", rate="0%", 
     list_file = tempfile.NamedTemporaryFile(delete=False, suffix=".txt").name
     with open(list_file, "w", encoding="utf-8") as lf:
         for p in out_paths:
-            # safely quote single quotes for ffmpeg concat demuxer
             q = p.replace("'", "'\\''")
             lf.write(f"file '{q}'\n")
 
@@ -195,6 +221,7 @@ def process_video():
     except subprocess.CalledProcessError as e:
         return jsonify({"error": f"ffmpeg error: {e}"}), 500
     except Exception as e:
+        # show exact failure so we can diagnose quickly
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
 
 
