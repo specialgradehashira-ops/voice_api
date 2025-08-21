@@ -1,4 +1,1 @@
 Flask==3.0.2
-edge-tts          # leave unpinned so it installs the newest token
-ffmpeg-python==0.2.0
-imageio-ffmpeg==0.5.1
