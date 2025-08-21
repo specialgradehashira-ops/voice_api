@@ -12,9 +12,9 @@ app = Flask(__name__)
 
 FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe()  # bundled ffmpeg from wheel
 
-# Tunables (override in Render → Environment if needed)
+# Tunables (can override in Render → Environment)
 TEXT_MAX_CHARS = int(os.environ.get("TEXT_MAX_CHARS", "20000"))
-TTS_CHARS_PER_CHUNK = int(os.environ.get("TTS_CHARS_PER_CHUNK", "2200"))  # smaller = lower RAM spikes
+TTS_CHARS_PER_CHUNK = int(os.environ.get("TTS_CHARS_PER_CHUNK", "2200"))  # smaller => lower RAM spikes
 
 
 def normalize_rate(val: str) -> str:
@@ -67,7 +67,9 @@ async def tts_to_mp3_streaming(text: str, voice="en-US-JennyNeural", rate="0%", 
     list_file = tempfile.NamedTemporaryFile(delete=False, suffix=".txt").name
     with open(list_file, "w", encoding="utf-8") as lf:
         for p in out_paths:
-            lf.write(f"file '{p.replace(\"'\", \"'\\\\''\")}'\n")
+            # safely quote single quotes for ffmpeg concat demuxer
+            q = p.replace("'", "'\\''")
+            lf.write(f"file '{q}'\n")
 
     out_mp3 = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3").name
     subprocess.check_call([
@@ -102,7 +104,6 @@ def mux_video_and_audio(video_path: str, tts_mp3: str, mode: str = "mix", bg_gai
         return out_path
 
     if mode == "dual":
-        # '0:a:0?' = map original audio only if it exists (no error if missing)
         cmd = [
             FFMPEG_BIN, "-y",
             "-stream_loop", "-1", "-i", video_path,
@@ -115,7 +116,7 @@ def mux_video_and_audio(video_path: str, tts_mp3: str, mode: str = "mix", bg_gai
         subprocess.check_call(cmd)
         return out_path
 
-    # mode == "mix": try to mix; if video has no audio, fall back to replace
+    # mode == "mix"
     try:
         fc = (
             f"[0:a]volume={bg_gain}[a0];"
@@ -194,7 +195,6 @@ def process_video():
     except subprocess.CalledProcessError as e:
         return jsonify({"error": f"ffmpeg error: {e}"}), 500
     except Exception as e:
-        # show better error text than just "0"
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
 
 
