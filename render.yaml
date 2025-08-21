@@ -2,6 +2,9 @@ services:
   - type: web
     name: voice-api
     env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python app.py
     plan: free
+    buildCommand: |
+      apt-get update && \
+      apt-get install -y ffmpeg espeak-ng && \
+      pip install -r requirements.txt
+    startCommand: python app.py
