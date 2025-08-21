@@ -1,107 +1,92 @@
-import io, os, tempfile, asyncio, subprocess
-from flask import Flask, request, send_file, jsonify
-import edge_tts
-import imageio_ffmpeg
+import os
+import tempfile
+import subprocess
+from fastapi import FastAPI, UploadFile, Form
+from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+import azure.cognitiveservices.speech as speechsdk
 
-app = Flask(__name__)
+app = FastAPI()
 
-# Static FFmpeg from imageio-ffmpeg (works on Render free)
-FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe()
+# --- CORS (so you can call from n8n, etc) ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-VOICES_ALLOWED = {"en-US-JennyNeural", "en-US-GuyNeural", "en-GB-LibbyNeural"}
+# --- Azure Speech Config ---
+SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY")
+SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION")
+VOICE = os.getenv("AZURE_SPEECH_VOICE", "en-US-JennyNeural")
 
-async def tts_to_mp3(text: str, voice="en-US-JennyNeural", rate="0%", volume="0%") -> str:
-    """Generate MP3 from text with edge-tts, chunking long text safely."""
-    t = (text or "").strip() or " "
-    chunks, CHUNK = [], 3800
-    while t:
-        c = t[:CHUNK]
-        cut = c.rfind(". ")
-        if cut > 1200:
-            c = c[:cut + 1]
-        chunks.append(c)
-        t = t[len(c):]
+def synthesize_speech(text: str, out_path: str, voice: str = VOICE):
+    """Generate speech using Azure TTS and save to a file"""
+    if not SPEECH_KEY or not SPEECH_REGION:
+        raise RuntimeError("Missing Azure credentials in env vars.")
 
-    part_paths = []
-    for c in chunks:
-        communicate = edge_tts.Communicate(
-            c,
-            voice=voice if voice in VOICES_ALLOWED else "en-US-JennyNeural",
-            rate=rate, volume=volume
-        )
-        buf = io.BytesIO()
-        async for part in communicate.stream():
-            if part[0] == "audio":
-                buf.write(part[1])
-        buf.seek(0)
-        part = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-        with open(part.name, "wb") as f:
-            f.write(buf.getvalue())
-        part_paths.append(part.name)
+    speech_config = speechsdk.SpeechConfig(
+        subscription=SPEECH_KEY, region=SPEECH_REGION
+    )
+    speech_config.speech_synthesis_voice_name = voice
+    audio_config = speechsdk.audio.AudioOutputConfig(filename=out_path)
 
-    if len(part_paths) == 1:
-        return part_paths[0]
+    synthesizer = speechsdk.SpeechSynthesizer(
+        speech_config=speech_config, audio_config=audio_config
+    )
+    result = synthesizer.speak_text_async(text).get()
 
-    # Concatenate MP3s without re-encoding
-    list_file = tempfile.NamedTemporaryFile(delete=False, suffix=".txt").name
-    with open(list_file, "w", encoding="utf-8") as f:
-        for p in part_paths:
-            f.write(f"file '{p}'\n")
+    if result.reason != speechsdk.ResultReason.SynthesizingAudioCompleted:
+        raise RuntimeError(f"TTS failed: {result.reason}")
 
-    out_mp3 = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3").name
-    cmd = [
-        FFMPEG_BIN, "-y",
-        "-f", "concat", "-safe", "0", "-i", list_file,
-        "-c", "copy",
-        out_mp3
-    ]
-    subprocess.check_call(cmd)
-    return out_mp3
+# --- Routes ---
+@app.get("/")
+def root():
+    return {"ok": True, "endpoint": "/process-video"}
 
-def mux_video_with_audio(video_path: str, audio_path: str) -> str:
-    """
-    Always loop the video and stop at the shortest stream.
-    - If audio < video: stops at audio end (video effectively trimmed).
-    - If audio > video: video loops until audio ends.
-    """
-    out_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
-    cmd = [
-        FFMPEG_BIN, "-y",
-        "-stream_loop", "-1", "-i", video_path,   # loop video indefinitely
-        "-i", audio_path,                         # audio (mp3)
-        "-map", "0:v:0", "-map", "1:a:0",
-        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-        "-shortest",
-        out_path
-    ]
-    subprocess.check_call(cmd)
-    return out_path
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
-@app.route("/process-video", methods=["POST"])
-def process_video():
-    try:
-        upfile = next(iter(request.files.values()), None)
-        if not upfile:
-            return jsonify({"error": "No video file"}), 400
+@app.post("/process-video")
+async def process_video(
+    video: UploadFile,
+    text: str = Form(...),
+    voice: str = Form(VOICE),
+    rate: str = Form("+0%"),
+    volume: str = Form("+0%"),
+):
+    # temp files
+    with tempfile.TemporaryDirectory() as tmpdir:
+        video_path = os.path.join(tmpdir, "input.mp4")
+        audio_path = os.path.join(tmpdir, "voice.mp3")
+        out_path = os.path.join(tmpdir, "out.mp4")
 
-        text = (request.form.get("text") or "").strip()
-        voice = request.form.get("voice", "en-US-JennyNeural")
-        rate = request.form.get("rate", "0%")
-        volume = request.form.get("volume", "0%")
+        # save uploaded video
+        with open(video_path, "wb") as f:
+            f.write(await video.read())
 
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as vf:
-            upfile.save(vf.name)
-            video_path = vf.name
+        # synthesize audio
+        synthesize_speech(text, audio_path, voice=voice)
 
-        audio_mp3 = asyncio.run(tts_to_mp3(text, voice=voice, rate=rate, volume=volume))
-        out_path = mux_video_with_audio(video_path, audio_mp3)
+        # ffmpeg: merge voiceover with video
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", video_path,
+            "-i", audio_path,
+            "-c:v", "copy",
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+            "-shortest", out_path,
+        ]
+        subprocess.run(cmd, check=True)
 
-        return send_file(out_path, mimetype="video/mp4", as_attachment=True, download_name="output.mp4")
+        return FileResponse(out_path, media_type="video/mp4", filename="out.mp4")
 
-    except subprocess.CalledProcessError as e:
-        return jsonify({"error": f"ffmpeg error: {e}"}), 500
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    import uvicorn
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("app:app", host="0.0.0.0", port=port)
