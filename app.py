@@ -1,184 +1,234 @@
-import os, io, shlex, tempfile, subprocess
-from flask import Flask, request, jsonify, send_file, after_this_request
+import io
+import os
+import tempfile
+import asyncio
+import subprocess
+from typing import List
+from flask import Flask, request, send_file, jsonify
+import edge_tts
+import imageio_ffmpeg
 
 app = Flask(__name__)
 
-# Friendly names → espeak-ng voice codes
-VOICE_MAP = {
-    "en-US-JennyNeural": "en-us+f3",
-    "en-US-GuyNeural": "en-us+m3",
-    "en-GB-LibbyNeural": "en-gb+f3",
-    "en-GB-RyanNeural": "en-gb+m3",
-}
-DEFAULT_ESPEAK = "en-us+f3"
+# ffmpeg binary from imageio-ffmpeg (bundled wheel)
+FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe()
+# ffprobe is available on Render’s base image; use plain name.
+FFPROBE_BIN = "ffprobe"
 
-def pick_voice(v: str) -> str:
-    v = (v or "").strip()
-    return VOICE_MAP.get(v, DEFAULT_ESPEAK)
+# Tunables (you can override via Render → Environment)
+TEXT_MAX_CHARS = int(os.environ.get("TEXT_MAX_CHARS", "20000"))          # hard limit per request
+TTS_CHARS_PER_CHUNK = int(os.environ.get("TTS_CHARS_PER_CHUNK", "2200")) # smaller = lower memory spikes
 
-def parse_rate(rate: str) -> int:
-    base = 175  # espeak-ng default
-    if not rate:
-        return base
-    s = rate.strip()
-    if s.endswith("%"):
-        try:
-            pct = float(s[:-1])
-        except Exception:
-            pct = 0.0
-        wpm = base * (1.0 + pct / 100.0)
-    else:
-        try:
-            wpm = float(s)
-        except Exception:
-            wpm = base
-    return max(80, min(450, int(wpm)))
-
-def parse_volume(volume: str) -> int:
-    base = 150
-    if not volume:
-        return base
-    s = volume.strip()
-    if s.endswith("%"):
-        try:
-            pct = float(s[:-1])
-        except Exception:
-            pct = 0.0
-        amp = base * (1.0 + pct / 100.0)
-    else:
-        try:
-            amp = float(s)
-        except Exception:
-            amp = base
-    return max(0, min(200, int(amp)))
 
 def ffprobe_duration(path: str) -> float:
-    out = subprocess.check_output([
-        "ffprobe", "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        path
-    ]).decode().strip()
-    return float(out)
+    """Return media duration in seconds."""
+    try:
+        out = subprocess.check_output([
+            FFPROBE_BIN, "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            path,
+        ]).decode().strip()
+        return float(out)
+    except Exception:
+        return 0.0
 
-def tts_espeak_to_wav(text: str, espeak_voice: str, wpm: int, amp: int) -> str:
-    t = (text or " ").strip() or " "
-    CH = 1800
-    chunks = []
+
+def video_has_audio(path: str) -> bool:
+    """True if input file has an audio stream."""
+    try:
+        out = subprocess.check_output([
+            FFPROBE_BIN, "-v", "error",
+            "-select_streams", "a",
+            "-show_entries", "stream=codec_type",
+            "-of", "csv=p=0",
+            path,
+        ]).decode().strip()
+        return bool(out)
+    except Exception:
+        return False
+
+
+def normalize_rate(val: str) -> str:
+    """Accept '0%', '+5%', '-10%', or integers like '180' (treated as %)."""
+    if not val:
+        return "0%"
+    s = str(val).strip()
+    if s.endswith("%"):
+        return s
+    # try number, convert to percent string
+    try:
+        n = int(float(s))
+        return f"{n:+d}%"
+    except Exception:
+        return "0%"
+
+
+async def tts_to_mp3_streaming(text: str, voice="en-US-JennyNeural", rate="0%", volume="0%") -> str:
+    """
+    Generate MP3 using Edge TTS.
+    Streams audio bytes directly to a temp file per chunk (no large in-RAM buffers),
+    then concatenates chunks losslessly with ffmpeg concat demuxer.
+    """
+    t = (text or " ").strip()
+    # Split into safe chunks
+    chunks: List[str] = []
     while t:
-        c = t[:CH]
+        c = t[:TTS_CHARS_PER_CHUNK]
+        # prefer to cut on sentence boundary if chunk is reasonably long
         cut = c.rfind(". ")
-        if cut > 600:
+        if cut > 1000:
             c = c[:cut + 1]
         chunks.append(c)
         t = t[len(c):]
 
-    part_paths = []
+    part_paths: List[str] = []
     for c in chunks:
-        out_wav = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
-        subprocess.check_call([
-            "espeak-ng",
-            "-v", espeak_voice,
-            "-s", str(wpm),
-            "-a", str(amp),
-            "-w", out_wav,
-            c
-        ])
-        part_paths.append(out_wav)
+        communicate = edge_tts.Communicate(
+            c,
+            voice=voice,
+            rate=rate,
+            volume=volume,
+        )
+        # Stream straight to disk
+        part_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+        try:
+            async for part in communicate.stream():
+                if part[0] == "audio":
+                    part_file.write(part[1])
+        finally:
+            part_file.close()
+        part_paths.append(part_file.name)
 
     if len(part_paths) == 1:
         return part_paths[0]
 
+    # Concatenate parts without re-encoding
     list_file = tempfile.NamedTemporaryFile(delete=False, suffix=".txt").name
     with open(list_file, "w", encoding="utf-8") as f:
         for p in part_paths:
-            f.write(f"file {shlex.quote(p)}\n")
+            # escape single quotes for concat list
+            safe = p.replace("'", "'\\''")
+            f.write(f"file '{safe}'\n")
 
-    out_all = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
+    out_mp3 = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3").name
     subprocess.check_call([
-        "ffmpeg", "-y",
+        FFMPEG_BIN, "-y",
         "-f", "concat", "-safe", "0", "-i", list_file,
         "-c", "copy",
-        out_all
+        out_mp3,
     ])
-    return out_all
+    return out_mp3
 
-def mux_video_and_audio(video_path: str, audio_path: str) -> str:
+
+def mux_video_and_audio(video_path: str, tts_mp3: str, mode: str = "mix", bg_gain: float = 0.6) -> str:
+    """
+    Combine video with TTS audio.
+      - mode="mix": lower original audio (bg_gain) and mix TTS on top
+      - mode="replace": drop original audio, keep only TTS
+      - mode="dual": two audio tracks (original + TTS)
+    If TTS longer than video, loop video (and its audio) and stop at the audio end.
+    """
     vdur = ffprobe_duration(video_path)
-    adur = ffprobe_duration(audio_path)
-    out_mp4 = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+    adur = ffprobe_duration(tts_mp3)
+    has_a = video_has_audio(video_path)
+    out_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
 
-    if adur > vdur + 0.05:
-        subprocess.check_call([
-            "ffmpeg", "-y",
-            "-stream_loop", "-1",
-            "-t", f"{adur:.3f}",
-            "-i", video_path,
-            "-i", audio_path,
+    loop_args = ["-stream_loop", "-1"] if adur > vdur + 0.05 else []
+
+    if mode == "replace" or not has_a:
+        cmd = [
+            FFMPEG_BIN, "-y", *loop_args, "-i", video_path, "-i", tts_mp3,
             "-map", "0:v:0", "-map", "1:a:0",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-            "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "192k",
-            "-shortest",
-            "-movflags", "+faststart",
-            out_mp4
-        ])
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "160k",
+            "-shortest", out_path,
+        ]
+    elif mode == "dual":
+        cmd = [
+            FFMPEG_BIN, "-y", *loop_args, "-i", video_path, "-i", tts_mp3,
+            "-map", "0:v:0", "-map", "0:a:0", "-map", "1:a:0",
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "160k",
+            "-shortest", out_path,
+        ]
     else:
-        subprocess.check_call([
-            "ffmpeg", "-y",
-            "-i", video_path,
-            "-i", audio_path,
-            "-map", "0:v:0", "-map", "1:a:0",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-            "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "192k",
-            "-shortest",
-            "-movflags", "+faststart",
-            out_mp4
-        ])
-    return out_mp4
+        # mix
+        fc = (
+            f"[0:a]volume={bg_gain}[a0];"
+            f"[1:a]volume=1.0[a1];"
+            f"[a0][a1]amix=inputs=2:duration=longest:dropout_transition=0,aresample=async=1[a]"
+        )
+        cmd = [
+            FFMPEG_BIN, "-y", *loop_args, "-i", video_path, "-i", tts_mp3,
+            "-filter_complex", fc,
+            "-map", "0:v:0", "-map", "[a]",
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-ar", "48000",
+            "-shortest", out_path,
+        ]
+
+    subprocess.check_call(cmd)
+    return out_path
+
 
 @app.route("/", methods=["GET"])
 def root():
-    return jsonify(ok=True, endpoint="/process-video")
+    return jsonify({"ok": True, "endpoint": "/process-video"})
+
 
 @app.route("/process-video", methods=["POST"])
 def process_video():
     try:
-        up = next(iter(request.files.values()), None)
-        if not up:
-            return jsonify(error="No video file uploaded (field name 'video')"), 400
+        upfile = next(iter(request.files.values()), None)
+        if not upfile:
+            return jsonify({"error": "No video file provided (form-data key 'video')"}), 400
 
+        # Inputs
         text = (request.form.get("text") or "").strip()
-        voice = request.form.get("voice", "en-US-JennyNeural")
-        rate = request.form.get("rate", "+0%")
-        volume = request.form.get("volume", "+0%")
+        if not text:
+            return jsonify({"error": "Missing 'text'"}), 400
+        if len(text) > TEXT_MAX_CHARS:
+            return jsonify({
+                "error": f"text too long ({len(text)} chars). Limit is {TEXT_MAX_CHARS}. "
+                         f"Split into multiple requests or raise TEXT_MAX_CHARS env var."
+            }), 413
 
-        video_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
-        up.save(video_path)
+        voice = (request.form.get("voice") or "en-US-JennyNeural").strip()
+        rate  = normalize_rate(request.form.get("rate") or "0%")
+        volume = (request.form.get("volume") or "0%").strip()
+        mode = (request.form.get("mode") or "mix").strip().lower()
+        if mode not in {"mix", "replace", "dual"}:
+            mode = "mix"
+        try:
+            bg = float(request.form.get("bg", "0.6"))
+        except Exception:
+            bg = 0.6
+        bg = max(0.0, min(bg, 2.0))
 
-        espeak_voice = pick_voice(voice)
-        wpm = parse_rate(rate)
-        amp = parse_volume(volume)
+        # Save upload
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as vf:
+            upfile.save(vf.name)
+            video_path = vf.name
 
-        tts_wav = tts_espeak_to_wav(text or " ", espeak_voice, wpm, amp)
-        out_mp4 = mux_video_and_audio(video_path, tts_wav)
+        # Build TTS on disk (no big buffers)
+        tts_mp3 = asyncio.run(tts_to_mp3_streaming(text, voice=voice, rate=rate, volume=volume))
 
-        @after_this_request
-        def _cleanup(resp):
-            for p in (video_path, tts_wav):
-                try:
-                    os.unlink(p)
-                except Exception:
-                    pass
-            return resp
+        # Mux
+        out_path = mux_video_and_audio(video_path, tts_mp3, mode=mode, bg_gain=bg)
 
-        return send_file(out_mp4, as_attachment=True, download_name="output.mp4", mimetype="video/mp4")
+        return send_file(out_path, mimetype="video/mp4",
+                         as_attachment=True, download_name="output.mp4")
 
+    except MemoryError:
+        return jsonify({"error": "Server out of memory. Try shorter text, smaller chunks, or upgrade instance."}), 502
     except subprocess.CalledProcessError as e:
-        return jsonify(error=f"ffmpeg/espeak error: {e}"), 500
+        return jsonify({"error": f"ffmpeg error: {e}"}), 500
     except Exception as e:
-        return jsonify(error=str(e)), 500
+        return jsonify({"error": str(e)}), 500
+
+
+@app.errorhandler(413)
+def too_large(_e):
+    return jsonify({"error": "Payload too large"}), 413
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
