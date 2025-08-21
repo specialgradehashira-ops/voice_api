@@ -9,10 +9,9 @@ import imageio_ffmpeg
 
 app = Flask(__name__)
 
-# Get a static ffmpeg binary (downloaded/cached by imageio-ffmpeg)
+# Grab a static ffmpeg binary that imageio-ffmpeg downloads/caches
 FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe()
 
-# Voices you can allow from the sheet/API; fallback if not provided
 VOICES_ALLOWED = {
     "en-US-JennyNeural",
     "en-US-GuyNeural",
@@ -23,7 +22,7 @@ VOICES_ALLOWED = {
 def ffmpeg_duration_seconds(path: str) -> float:
     """
     Read media duration by parsing ffmpeg stderr ('Duration: 00:00:10.12').
-    We only have ffmpeg here (not ffprobe), so we parse the banner.
+    We only rely on ffmpeg (not ffprobe) here.
     """
     try:
         proc = subprocess.run(
@@ -45,28 +44,25 @@ def ffmpeg_duration_seconds(path: str) -> float:
 async def tts_to_mp3(text: str, voice: str, rate: str, volume: str) -> str:
     """
     Generate MP3 from (possibly long) text using edge-tts.
-    We chunk the text to ~3800 chars to keep it reliable, and then
-    concatenate all MP3 parts with the ffmpeg concat demuxer (no re-encode).
+    Chunk to ~3800 chars and concatenate parts losslessly with ffmpeg.
     """
-    # Normalize text (edge-tts accepts raw punctuation fine)
     t = (text or "").strip()
     if not t:
-        t = " "  # avoid empty input error
+        t = " "
 
-    # Chunk the text around ~3800 characters, preferring sentence boundaries.
+    # Chunk around ~3800 chars, prefer to end on a sentence boundary
     chunks = []
     CHUNK = 3800
     while t:
         c = t[:CHUNK]
         cut = c.rfind(". ")
-        if cut > 1200:  # prefer ending on a sentence if chunk is long enough
+        if cut > 1200:
             c = c[:cut + 1]
         chunks.append(c)
         t = t[len(c):]
 
     part_paths = []
     for c in chunks:
-        # Stream TTS audio bytes into memory, then write as MP3
         communicate = edge_tts.Communicate(
             c,
             voice=voice if voice in VOICES_ALLOWED else "en-US-JennyNeural",
@@ -79,20 +75,19 @@ async def tts_to_mp3(text: str, voice: str, rate: str, volume: str) -> str:
                 buf.write(part[1])
         buf.seek(0)
 
-        part = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-        with open(part.name, "wb") as f:
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+        with open(tmp.name, "wb") as f:
             f.write(buf.getvalue())
-        part_paths.append(part.name)
+        part_paths.append(tmp.name)
 
     if len(part_paths) == 1:
         return part_paths[0]
 
-    # Concatenate MP3 parts losslessly with ffmpeg concat demuxer
+    # Concat demuxer list file: our /tmp/* paths have no spaces/quotes, so no escaping needed
     list_file = tempfile.NamedTemporaryFile(delete=False, suffix=".txt").name
     with open(list_file, "w", encoding="utf-8") as f:
         for p in part_paths:
-            # Escape single quotes in path for concat file format
-            f.write(f"file '{p.replace(\"'\", \"'\\\\''\")}'\n")
+            f.write(f"file {p}\n")
 
     out_mp3 = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3").name
     cmd = [
@@ -107,29 +102,26 @@ async def tts_to_mp3(text: str, voice: str, rate: str, volume: str) -> str:
 
 def mux_loop_or_trim(video_path: str, audio_path: str) -> str:
     """
-    If audio is longer than video, loop the video until audio ends (stop at audio).
-    If audio is shorter, trim the video to match audio (stop at audio).
-    We always encode audio to AAC; video is copied (no re-encode).
+    If audio > video, loop video to match audio; else trim video to audio.
+    Video stream is copied; audio encoded to AAC.
     """
     vdur = ffmpeg_duration_seconds(video_path)
     adur = ffmpeg_duration_seconds(audio_path)
 
     out_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
 
-    # audio longer → loop video
     if adur > vdur + 0.05:
         cmd = [
             FFMPEG_BIN, "-y",
             "-stream_loop", "-1", "-i", video_path,
             "-i", audio_path,
             "-map", "0:v:0", "-map", "1:a:0",
-            "-c:v", "copy",  # keep original video
+            "-c:v", "copy",
             "-c:a", "aac", "-b:a", "192k",
-            "-shortest",      # stop when shortest of the two ends → audio controls length
+            "-shortest",
             out_path
         ]
     else:
-        # audio shorter or almost equal → trim video to audio
         cmd = [
             FFMPEG_BIN, "-y",
             "-i", video_path,
@@ -163,7 +155,6 @@ def process_video():
       - voice (optional): one of VOICES_ALLOWED (default Jenny)
       - rate (optional): e.g. +10%, -5%
       - volume (optional): e.g. +5%, -10%
-    Returns: MP4 with voiceover; video loops or trims to match audio.
     """
     try:
         upfile = next(iter(request.files.values()), None)
@@ -182,12 +173,9 @@ def process_video():
             upfile.save(vf.name)
             video_path = vf.name
 
-        # 1) TTS → MP3 (handles long text via chunking + concat)
-        # NOTE: edge-tts is async; run it in a one-off event loop per request
         import asyncio
         audio_mp3 = asyncio.run(tts_to_mp3(text, voice=voice, rate=rate, volume=volume))
 
-        # 2) Mux with loop/trim logic
         out_path = mux_loop_or_trim(video_path, audio_mp3)
 
         return send_file(out_path, mimetype="video/mp4", as_attachment=True, download_name="output.mp4")
@@ -199,6 +187,5 @@ def process_video():
 
 
 if __name__ == "__main__":
-    # Flask dev server is fine on Render free tier
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
